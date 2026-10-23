@@ -1,0 +1,31 @@
+name: g2b-alert
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 공고 조회 및 텔레그램 발송
+        env:
+          G2B_SERVICE_KEY: ${{ secrets.G2B_SERVICE_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python notify_bids.py
+      - name: 상태 파일 저장
+        run: |
+          git config user.name "g2b-bot"
+          git config user.email "g2b-bot@users.noreply.github.com"
+          git add seen.json
+          git commit -m "update seen" || echo "no change"
+          git push
