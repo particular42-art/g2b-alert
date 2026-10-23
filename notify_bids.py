@@ -1,4 +1,4 @@
-"""나라장터 회계 관련 용역 입찰공고 텔레그램 알림 (v7, GitHub Actions용)
+"""나라장터 회계 관련 용역 입찰공고 텔레그램 알림 (v8, 나라장터+누리장터, GitHub Actions용)
 
 환경변수
   G2B_SERVICE_KEY  : 공공데이터포털 일반 인증키
@@ -15,7 +15,10 @@ INCLUDE = ["회계", "결산", "재무", "세무", "원가", "가치평가", "�
            "정산검증", "사업비 정산", "외부감사", "내부통제", "감사인"]
 NOISE = ["회계연도", "회계년도"]          # 공고명에서 지운 뒤 키워드 매칭 (예: '2027회계연도 청소용역')
 EXCLUDE = ["감정평가"]                    # 포함 시 공고 자체 제외
-ENDPOINT = "https://apis.data.go.kr/1230000/ad/BidPublicInfoService/getBidPblancListInfoServc"  # 용역
+SOURCES = [  # (표시이름, 용역 공고목록 주소, 1회 조회 건수, 공고번호 접두어)
+    ("나라장터", "https://apis.data.go.kr/1230000/ad/BidPublicInfoService/getBidPblancListInfoServc", 999, ""),
+    ("누리장터", "https://apis.data.go.kr/1230000/ao/PrvtBidNtceService/getPrvtBidPblancListInfoServc", 100, "N-"),
+]
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seen.json")
 KEEP_DAYS = 30
 KST = timezone(timedelta(hours=9))
@@ -32,21 +35,28 @@ def http(url, data=None, label=""):
         raise RuntimeError(f"[{label}] HTTP {e.code}: {body}") from None
 
 
-def fetch(begin, end):
+def g(it, *keys):
+    """여러 후보 항목명 중 값이 있는 첫 번째를 반환 (두 API의 항목명 차이 흡수)"""
+    for k in keys:
+        if it.get(k) not in (None, ""):
+            return it[k]
+    return ""
+
+
+def fetch(endpoint, rows, begin, end, label):
     items, page = [], 1
+    key = "".join(os.environ["G2B_SERVICE_KEY"].split()).replace("\ufeff", "").replace("\u200b", "")
     while True:
-        key = "".join(os.environ["G2B_SERVICE_KEY"].split()).replace("\ufeff", "").replace("\u200b", "")
         q = f"ServiceKey={key}&" + urllib.parse.urlencode({  # 키는 브라우저처럼 그대로 전송
-            "type": "json",
-            "inqryDiv": "1", "inqryBgnDt": begin, "inqryEndDt": end,
-            "pageNo": page, "numOfRows": 999})
-        raw = http(f"{ENDPOINT}?{q}", label="나라장터 API")
+            "type": "json", "inqryDiv": "1", "inqryBgnDt": begin, "inqryEndDt": end,
+            "pageNo": page, "numOfRows": rows})
+        raw = http(f"{endpoint}?{q}", label=label)
         try:
             resp = json.loads(raw)["response"]
         except (ValueError, KeyError):
-            sys.exit(f"API 응답 오류: {raw[:300]}")
+            raise RuntimeError(f"[{label}] 응답 오류: {raw[:300]}")
         if resp["header"]["resultCode"] != "00":
-            sys.exit(f"API 오류: {resp['header']}")
+            raise RuntimeError(f"[{label}] API 오류: {resp['header']}")
         body = resp["body"]
         got = body.get("items") or []
         if isinstance(got, dict):
@@ -54,7 +64,7 @@ def fetch(begin, end):
         if isinstance(got, dict):
             got = [got]
         items += got
-        if page * 999 >= int(body.get("totalCount", 0)) or not got:
+        if page * rows >= int(body.get("totalCount", 0) or 0) or not got:
             return items
         page += 1
 
@@ -85,14 +95,15 @@ def tg_send(text):
 
 def send_alert(rows, now):
     blocks = []
-    for r in rows:
-        link = escape(r.get("bidNtceDtlUrl") or "")
-        name = escape(r.get("bidNtceNm", ""))
+    for src, r in rows:
+        link = escape(g(r, "bidNtceDtlUrl", "bidNtceUrl", "ntceUrl", "ntceSpecDocUrl1"))
+        name = escape(g(r, "bidNtceNm", "ntceNm"))
+        price = won(g(r, "presmptPrce", "asignBdgtAmt", "bssamt"))
         blocks.append(
-            f"• <a href='{link}'>{name}</a>\n"
-            f"  {escape(r.get('ntceInsttNm', ''))} | 마감 {escape(r.get('bidClseDt', '') or '-')}"
-            f" | 추정 {won(r.get('presmptPrce'))}원")
-    head = f"<b>[나라장터] 회계 관련 용역공고 {len(rows)}건</b> ({now:%m/%d %H:%M})"
+            f"• [{src}] <a href='{link}'>{name}</a>\n"
+            f"  {escape(g(r, 'ntceInsttNm', 'dminsttNm'))} | 마감 {escape(g(r, 'bidClseDt') or '-')}"
+            f" | {price}원")
+    head = f"<b>[입찰알림] 회계 관련 용역공고 {len(rows)}건</b> ({now:%m/%d %H:%M})"
     msg = head
     for b in blocks:                      # 텔레그램 1회 최대 4096자 → 나눠 보냄
         if len(msg) + len(b) + 2 > 3800:
@@ -113,12 +124,20 @@ def main():
     seen = state.get("seen", {})
 
     new = []
-    for it in fetch(begin.strftime("%Y%m%d%H%M"), now.strftime("%Y%m%d%H%M")):
-        key = f"{it.get('bidNtceNo')}-{it.get('bidNtceOrd')}"
-        if key in seen or not is_target(it.get("bidNtceNm", "")):
+    for src, endpoint, rows, prefix in SOURCES:
+        try:
+            items = fetch(endpoint, rows, begin.strftime("%Y%m%d%H%M"), now.strftime("%Y%m%d%H%M"), src)
+        except Exception as e:            # 한쪽이 실패해도 다른 쪽 알림은 진행
+            print(f"[경고] {src} 조회 실패: {e}")
             continue
-        seen[key] = now.strftime("%Y-%m-%d")
-        new.append(it)
+        if items:
+            print(f"[{src}] 조회 {len(items)}건, 항목명: {sorted(items[0].keys())[:40]}")
+        for it in items:
+            key = f"{prefix}{g(it, 'bidNtceNo')}-{g(it, 'bidNtceOrd')}"
+            if key in seen or not is_target(g(it, "bidNtceNm", "ntceNm")):
+                continue
+            seen[key] = now.strftime("%Y-%m-%d")
+            new.append((src, it))
 
     if new:
         send_alert(new, now)
