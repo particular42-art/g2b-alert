@@ -29,3 +29,4 @@ jobs:
           git add seen.json
           git commit -m "update seen" || echo "no change"
           git push
+   # schedule refresh
